@@ -1,0 +1,13 @@
+{{- if .Values.monitoring.grafanaDashboard.enabled }}
+# Picked up by the Grafana dashboard sidecar (enabled by default in kube-prometheus-stack)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "slo-service.fullname" . }}-dashboard
+  labels:
+    {{- include "slo-service.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+data:
+  slo-service.json: |-
+    {{- .Files.Get "files/dashboard.json" | nindent 4 }}
+{{- end }}

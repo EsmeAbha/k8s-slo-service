@@ -1,0 +1,67 @@
+# SLO: 99.5% of /api requests succeed over 30 days -> error budget = 0.5%.
+# Alerts use multi-window burn rates (Google SRE Workbook, ch. 5): page when the budget is
+# burning fast enough to be gone in ~2 days, open a ticket when it would be gone in ~5 days.
+# Single source of truth: mounted by docker-compose and templated into a PrometheusRule by Helm.
+groups:
+  - name: slo-service-recording
+    rules:
+      - record: slo:request_errors:ratio_rate5m
+        expr: |
+          sum(rate(slo_service_http_requests_total{status=~"5.."}[5m]))
+          / clamp_min(sum(rate(slo_service_http_requests_total[5m])), 1e-9)
+      - record: slo:request_errors:ratio_rate30m
+        expr: |
+          sum(rate(slo_service_http_requests_total{status=~"5.."}[30m]))
+          / clamp_min(sum(rate(slo_service_http_requests_total[30m])), 1e-9)
+      - record: slo:request_errors:ratio_rate1h
+        expr: |
+          sum(rate(slo_service_http_requests_total{status=~"5.."}[1h]))
+          / clamp_min(sum(rate(slo_service_http_requests_total[1h])), 1e-9)
+      - record: slo:request_errors:ratio_rate6h
+        expr: |
+          sum(rate(slo_service_http_requests_total{status=~"5.."}[6h]))
+          / clamp_min(sum(rate(slo_service_http_requests_total[6h])), 1e-9)
+      - record: slo:request_latency_seconds:p95_5m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(slo_service_http_request_duration_seconds_bucket[5m])))
+
+  - name: slo-service-alerts
+    rules:
+      - alert: SLOErrorBudgetFastBurn
+        expr: |
+          slo:request_errors:ratio_rate1h > (14.4 * 0.005)
+          and
+          slo:request_errors:ratio_rate5m > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "slo-service is burning its 30-day error budget 14x too fast"
+          runbook_url: "docs/runbook.md#sloerrorbudgetfastburn"
+      - alert: SLOErrorBudgetSlowBurn
+        expr: |
+          slo:request_errors:ratio_rate6h > (6 * 0.005)
+          and
+          slo:request_errors:ratio_rate30m > (6 * 0.005)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "slo-service is burning its 30-day error budget 6x too fast"
+          runbook_url: "docs/runbook.md#sloerrorbudgetslowburn"
+      - alert: SLOLatencyP95High
+        expr: slo:request_latency_seconds:p95_5m > 0.3
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "slo-service p95 latency is above 300ms"
+          runbook_url: "docs/runbook.md#slolatencyp95high"
+      - alert: SLOServiceMetricsAbsent
+        expr: absent(slo_service_build_info)
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "No slo-service instance is being scraped"
+          runbook_url: "docs/runbook.md#sloservicemetricsabsent"

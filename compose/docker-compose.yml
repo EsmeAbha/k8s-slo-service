@@ -1,0 +1,25 @@
+# Local stack without Kubernetes: app + Prometheus (same SLO rules) + Grafana (same dashboard).
+#   docker compose -f compose/docker-compose.yml up --build
+#   app http://localhost:8000  ·  Prometheus http://localhost:9090  ·  Grafana http://localhost:3000 (admin/admin)
+services:
+  app:
+    build: ..
+    environment:
+      CHAOS_ENABLED: "true"
+      APP_VERSION: local
+    ports: ["8000:8000"]
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../chart/files/slo-rules.yaml:/etc/prometheus/slo-rules.yaml:ro
+    ports: ["9090:9090"]
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../chart/files/dashboard.json:/var/lib/grafana/dashboards/slo-service.json:ro
+    ports: ["3000:3000"]

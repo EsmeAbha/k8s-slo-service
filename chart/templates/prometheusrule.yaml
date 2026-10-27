@@ -1,0 +1,11 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "slo-service.fullname" . }}
+  labels:
+    {{- include "slo-service.labels" . | nindent 4 }}
+    release: {{ .Values.monitoring.prometheusReleaseLabel }}
+spec:
+  {{- .Files.Get "files/slo-rules.yaml" | nindent 2 }}
+{{- end }}

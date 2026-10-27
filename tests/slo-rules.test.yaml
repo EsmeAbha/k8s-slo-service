@@ -1,0 +1,60 @@
+# Unit tests for the alert rules: promtool test rules tests/slo-rules.test.yaml
+rule_files:
+  - ../chart/files/slo-rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 10% errors (budget allows 0.5%): fast burn must page.
+  - interval: 1m
+    input_series:
+      - series: 'slo_service_http_requests_total{method="GET",route="/api/orders/{order_id}",status="200"}'
+        values: '0+90x120'
+      - series: 'slo_service_http_requests_total{method="GET",route="/api/orders/{order_id}",status="503"}'
+        values: '0+10x120'
+      - series: 'slo_service_build_info{version="test"}'
+        values: '1x120'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SLOErrorBudgetFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "slo-service is burning its 30-day error budget 14x too fast"
+              runbook_url: "docs/runbook.md#sloerrorbudgetfastburn"
+      - eval_time: 70m
+        alertname: SLOServiceMetricsAbsent
+        exp_alerts: []
+
+  # 0.2% errors: inside budget, nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'slo_service_http_requests_total{method="GET",route="/api/orders/{order_id}",status="200"}'
+        values: '0+998x120'
+      - series: 'slo_service_http_requests_total{method="GET",route="/api/orders/{order_id}",status="500"}'
+        values: '0+2x120'
+      - series: 'slo_service_build_info{version="test"}'
+        values: '1x120'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SLOErrorBudgetFastBurn
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: SLOErrorBudgetSlowBurn
+        exp_alerts: []
+
+  # Nothing scraped: the "absent" alert pages after 5 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="other"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SLOServiceMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "No slo-service instance is being scraped"
+              runbook_url: "docs/runbook.md#sloservicemetricsabsent"

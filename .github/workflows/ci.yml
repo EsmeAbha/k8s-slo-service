@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  app-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest -q
+
+  alert-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: promtool check + unit-test the SLO rules
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w --entrypoint promtool prom/prometheus:v2.54.1 check rules chart/files/slo-rules.yaml
+          docker run --rm -v "$PWD:/w" -w /w --entrypoint promtool prom/prometheus:v2.54.1 test rules tests/slo-rules.test.yaml
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - name: helm lint (defaults and with monitoring enabled)
+        run: |
+          helm lint chart
+          helm lint chart --set monitoring.serviceMonitor.enabled=true,monitoring.prometheusRule.enabled=true,monitoring.grafanaDashboard.enabled=true
+      - name: Validate rendered manifests against Kubernetes schemas
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          helm template t chart \
+            --set monitoring.serviceMonitor.enabled=true,monitoring.prometheusRule.enabled=true,monitoring.grafanaDashboard.enabled=true \
+            | ./kubeconform -strict -summary \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+
+  e2e-kind:
+    needs: [app-tests, alert-rules, chart]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: slo
+      - name: Build image and load it into kind
+        run: |
+          docker build -t slo-service:ci .
+          kind load docker-image slo-service:ci --name slo
+      - name: Install Prometheus Operator stack (no Grafana/Alertmanager to keep CI fast)
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+            --namespace monitoring --create-namespace --wait --timeout 10m \
+            --set grafana.enabled=false --set alertmanager.enabled=false
+      - name: Install slo-service with monitoring
+        run: |
+          helm install demo chart --wait --timeout 5m \
+            --set image.tag=ci --set image.pullPolicy=Never --set env.CHAOS_ENABLED=true \
+            --set monitoring.serviceMonitor.enabled=true,monitoring.prometheusRule.enabled=true
+          kubectl get pods -l app.kubernetes.io/instance=demo
+      - name: Smoke test, then check Prometheus scrapes it and loaded the rules
+        run: |
+          kubectl port-forward svc/demo-slo-service 8000:80 & sleep 3
+          for i in $(seq 1 50); do curl -sf localhost:8000/api/orders/$i > /dev/null; done
+          curl -sf localhost:8000/metrics | grep 'slo_service_http_requests_total{method="GET",route="/api/orders/{order_id}",status="200"}'
+          kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 9090:9090 & sleep 3
+          for i in $(seq 1 30); do
+            if curl -s 'localhost:9090/api/v1/query?query=slo_service_build_info' | grep -q '"value"'; then echo "scraped"; break; fi
+            sleep 10
+          done
+          curl -s 'localhost:9090/api/v1/query?query=slo_service_build_info' | grep -q '"value"'
+          curl -s localhost:9090/api/v1/rules | grep -q SLOErrorBudgetFastBurn && echo "rules loaded"
+      - name: Rolling update drops zero requests (readiness + preStop + maxUnavailable=0)
+        run: |
+          # traffic from inside the cluster through the Service, like real clients
+          kubectl run probe --image=curlimages/curl:8.10.1 --restart=Never --command -- sh -c \
+            'f=0; for i in $(seq 1 240); do curl -sf -m 2 http://demo-slo-service/api/orders/$i >/dev/null || f=$((f+1)); sleep 0.25; done; echo FAILS=$f'
+          kubectl wait --for=condition=Ready pod/probe --timeout=60s
+          helm upgrade demo chart --reuse-values --set env.BASE_LATENCY_MS=25 --wait --timeout 5m
+          kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/probe --timeout=180s
+          kubectl logs probe
+          kubectl logs probe | grep -q '^FAILS=0$'

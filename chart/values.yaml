@@ -1,0 +1,40 @@
+image:
+  repository: slo-service
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+env:
+  BASE_LATENCY_MS: "20"
+  WARMUP_SECONDS: "2"
+  CHAOS_ENABLED: "false"   # set "true" only in test clusters
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { memory: 128Mi }   # no CPU limit: avoids throttling; requests drive scheduling and HPA
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+service:
+  port: 80
+
+# Requires the Prometheus Operator CRDs (e.g. kube-prometheus-stack).
+monitoring:
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+  prometheusRule:
+    enabled: false
+  grafanaDashboard:
+    enabled: false
+  # kube-prometheus-stack only selects ServiceMonitors/PrometheusRules carrying its release label
+  prometheusReleaseLabel: kube-prometheus-stack

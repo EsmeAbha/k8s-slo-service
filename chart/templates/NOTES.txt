@@ -1,0 +1,8 @@
+slo-service is deployed as {{ include "slo-service.fullname" . }}.
+
+  kubectl port-forward svc/{{ include "slo-service.fullname" . }} 8000:{{ .Values.service.port }}
+  curl localhost:8000/api/orders/1
+  curl localhost:8000/metrics | grep slo_service_
+
+Monitoring: serviceMonitor={{ .Values.monitoring.serviceMonitor.enabled }} prometheusRule={{ .Values.monitoring.prometheusRule.enabled }} dashboard={{ .Values.monitoring.grafanaDashboard.enabled }}
+Runbook: docs/runbook.md
