@@ -1,0 +1,33 @@
+# Envoy in front of three instances. Start it with edge/run.sh, which also creates the test certificate.
+# The instances' ports are published on loopback only so the drill can inject faults directly.
+x-app: &app
+  build: ..
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+
+services:
+  app1:
+    <<: *app
+    environment: {CHAOS_ENABLED: "true", APP_VERSION: app1}
+    ports: ["127.0.0.1:18001:8000"]
+  app2:
+    <<: *app
+    environment: {CHAOS_ENABLED: "true", APP_VERSION: app2}
+    ports: ["127.0.0.1:18002:8000"]
+  app3:
+    <<: *app
+    environment: {CHAOS_ENABLED: "true", APP_VERSION: app3}
+    ports: ["127.0.0.1:18003:8000"]
+  envoy:
+    image: envoyproxy/envoy:distroless-v1.40.2
+    command: ["-c", "/etc/envoy/envoy.yaml", "--disable-hot-restart"]
+    read_only: true
+    cap_drop: [ALL]
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./certs:/certs:ro
+    ports:
+      - "8443:8443"
+      - "127.0.0.1:9901:9901"
+    depends_on: [app1, app2, app3]

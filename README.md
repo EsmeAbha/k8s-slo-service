@@ -18,6 +18,29 @@ A small orders API run the way an SRE team runs production services. It has SLOs
 
 The SLO rules and the dashboard each live in **one file**, used by both docker-compose and Helm, so local and cluster monitoring can't drift apart.
 
+## The edge: Envoy, tested by breaking things
+
+`edge/` puts Envoy in front of three instances: TLS at the edge, least-request load balancing, health checks, retries and a rate limit. `edge/drill.py` runs steady traffic, breaks a backend and measures what clients actually saw. CI fails if more than 1% of client requests fail.
+
+| Scenario | What should happen | Envoy feature |
+|---|---|---|
+| An instance returns 503 for everything, but passes health checks | Clients are unaffected, and it's ejected, then returns | Outlier detection, retries on another host |
+| An instance hangs for 5 s | Clients still get answers, and nobody waits past the timeout | Per-try and route timeouts |
+| An instance is killed without warning | Clients are unaffected, it's removed, and it rejoins when it's back | Retries on connect failure, active health checks |
+| A burst over the limit | The excess gets 429, and nothing else fails | Local rate limit |
+| Requests for `/metrics`, `/chaos`, or `/api/orders/../../chaos` | 404: internal paths aren't reachable from outside | Path normalisation, a default-deny route |
+
+**Decisions:**
+- **Only GET is retried.** Repeating a write could apply it twice. Retries are also capped at 20% of load, so they can't turn a brownout into an outage.
+- **Two kinds of detection.** Health checks catch an instance that is down. Only passive outlier detection catches one that looks healthy but fails real requests.
+- **Ejection can't remove most of the pool.** At most half of the instances can be ejected, so a shared fault doesn't take everything out.
+
+```bash
+bash edge/run.sh       # needs Docker; validates the config, starts the stack, runs the drill
+```
+
+**Limits:** this is one Envoy on one machine, with a throwaway certificate and a static config. It shows how the edge behaves when a backend fails, not how Envoy is run at scale, and it doesn't cover BGP or anycast.
+
 ## Run locally (no Kubernetes)
 
 ```bash

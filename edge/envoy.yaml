@@ -1,0 +1,128 @@
+# TLS edge in front of three instances of the orders API. `edge/drill.py` breaks a backend under
+# traffic and checks each behaviour here; `tests/test_edge_config.py` guards the ones a drill can't.
+admin:
+  # Stats and controls. Published on the host's loopback only (docker-compose.yml), never through :8443.
+  address: {socket_address: {address: 0.0.0.0, port_value: 9901}}
+
+static_resources:
+  listeners:
+    - name: https
+      address: {socket_address: {address: 0.0.0.0, port_value: 8443}}
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_params: {tls_minimum_protocol_version: TLSv1_2}
+                alpn_protocols: [h2, http/1.1]
+                tls_certificates:
+                  - certificate_chain: {filename: /certs/edge.crt}
+                    private_key: {filename: /certs/edge.key}
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: edge
+                use_remote_address: true
+                # Resolved before routing, so /api/orders/../../chaos can't reach a blocked path.
+                normalize_path: true
+                merge_slashes: true
+                stream_idle_timeout: 30s
+                request_timeout: 30s
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        json_format:
+                          time: "%START_TIME%"
+                          method: "%REQ(:METHOD)%"
+                          path: "%REQ(:PATH)%"
+                          status: "%RESPONSE_CODE%"
+                          flags: "%RESPONSE_FLAGS%"
+                          upstream: "%UPSTREAM_HOST%"
+                          attempts: "%UPSTREAM_REQUEST_ATTEMPT_COUNT%"
+                          duration_ms: "%DURATION%"
+                http_filters:
+                  - name: envoy.filters.http.local_ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                      stat_prefix: edge
+                      token_bucket: {max_tokens: 200, tokens_per_fill: 100, fill_interval: 1s}
+                      filter_enabled:
+                        runtime_key: edge_ratelimit_enabled
+                        default_value: {numerator: 100, denominator: HUNDRED}
+                      filter_enforced:
+                        runtime_key: edge_ratelimit_enforced
+                        default_value: {numerator: 100, denominator: HUNDRED}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: orders
+                  virtual_hosts:
+                    - name: orders
+                      domains: ["*"]
+                      routes:
+                        # Only GET is retried: repeating a write could apply it twice.
+                        - match:
+                            prefix: /api/orders/
+                            headers:
+                              - name: ":method"
+                                string_match: {exact: GET}
+                          route:
+                            cluster: orders
+                            timeout: 3s
+                            retry_policy:
+                              retry_on: 5xx,reset,connect-failure
+                              num_retries: 2
+                              per_try_timeout: 1s
+                              retry_host_predicate:
+                                - name: envoy.retry_host_predicates.previous_hosts
+                                  typed_config:
+                                    "@type": type.googleapis.com/envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate
+                              host_selection_retry_max_attempts: 3
+                        - match: {prefix: /api/orders/}
+                          route: {cluster: orders, timeout: 3s}
+                        # Everything else stays internal: /metrics, /chaos and the health endpoints.
+                        - match: {prefix: /}
+                          direct_response: {status: 404}
+
+  clusters:
+    - name: orders
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      connect_timeout: 1s
+      lb_policy: LEAST_REQUEST
+      load_assignment:
+        cluster_name: orders
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: app1, port_value: 8000}}}
+              - endpoint: {address: {socket_address: {address: app2, port_value: 8000}}}
+              - endpoint: {address: {socket_address: {address: app3, port_value: 8000}}}
+      # Active: removes an instance that is down or draining, even with no traffic reaching it.
+      health_checks:
+        - timeout: 1s
+          interval: 2s
+          no_traffic_interval: 2s
+          unhealthy_threshold: 2
+          healthy_threshold: 1
+          http_health_check: {path: /readyz}
+      # Passive: removes an instance that answers health checks but fails real requests.
+      outlier_detection:
+        consecutive_5xx: 5
+        interval: 2s
+        base_ejection_time: 10s
+        max_ejection_percent: 50
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 200
+            max_pending_requests: 100
+            max_requests: 200
+            # Retries may add at most 20% to the load, so they can't turn a brownout into an outage.
+            retry_budget:
+              budget_percent: {value: 20.0}
+              min_retry_concurrency: 3
